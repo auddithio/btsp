@@ -1,0 +1,16 @@
+print(f"Keys for each video entry: {list(data.get('videos', [{}])[0].keys()) if data.get('videos') else 'No videos found'}")
+# Keys for each video entry: ['annotated_intervals', 'video_metadata', 'video_uid']
+# print out the keys for the first video entry to understand the structure
+if data.get("videos"):
+    print(f"Keys for the first video entry: {list(data['videos'][0].keys())}")
+    print(f"Sample annotated_intervals for the first video: {data['videos'][0].get('annotated_intervals', 'No annotated intervals found')}")
+    print(f"Sample video_metadata for the first video: {data['videos'][0].get('video_metadata', 'No video metadata found')}")
+    print(f"Sample video_uid for the first video: {data['videos'][0].get('video_uid', 'No video UID found')}")
+    print("\n")
+
+Keys for each video entry: ['annotated_intervals', 'video_metadata', 'video_uid']
+Keys for the first video entry: ['annotated_intervals', 'video_metadata', 'video_uid']
+Sample annotated_intervals for the first video: [{'clip_id': '451', 'clip_uid': 'a102c79b-405b-4a13-b21e-ab7dc6135b22', 'start_sec': 0.0, 'end_sec': 207.63, 'clip_parent_start_sec': 0.0, 'clip_parent_end_sec': 207.633, 'narrated_actions': [], 'start_frame': 0, 'end_frame': 6229, 'clip_parent_start_frame': 0, 'clip_parent_end_frame': 6229, 'redacted': True}]
+Sample video_metadata for the first video: {'video_start_pts': 0, 'video_base_numerator': 1, 'video_base_denominator': 15360, 'duration_sec': 207.633, 'num_frames': 6229, 'fps': 30.0, 'width': 2560, 'height': 1920, 'rotation': None}
+Sample video_uid for the first video: ee6f0404-9c97-4240-bd7b-2dcb340031d5
+
