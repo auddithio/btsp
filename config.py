@@ -30,7 +30,7 @@ class BTSPConfig:
 class ModelConfig:
     # ------- Backbone -------
     backbone: str = "MCG-NJU/videomae-base"   # HuggingFace VideoMAE checkpoint
-    freeze_backbone: bool = False
+    freeze_backbone: bool = True
     embed_dim: int = 768
 
     # ------- Predictive Head -------
