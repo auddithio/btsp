@@ -145,7 +145,7 @@ def build_scheduler(optimizer: optim.Optimizer, cfg: ExperimentConfig, steps_per
 # ---------------------------------------------------------------------------
 
 class Trainer:
-    def __init__(self, cfg: ExperimentConfig, distributed: bool = False):
+    def __init__(self, cfg: ExperimentConfig, num_verb_classes: int, num_noun_classes: int, distributed: bool = False):
         self.cfg = cfg
         self.distributed = distributed
 
@@ -162,7 +162,7 @@ class Trainer:
         # DDP syncs gradients across ranks (slow pathway).
         # BTSP memory bank buffers are intentionally NOT synced — each rank
         # accumulates independent memories from its own video shard.
-        raw_model = BTSPVideoTransformer(cfg.model).to(self.device)
+        raw_model = BTSPVideoTransformer(cfg.model, num_verb_classes, num_noun_classes).to(self.device)
         if distributed:
             self.model = DDP(raw_model, device_ids=[local_rank], find_unused_parameters=False)
         else:
@@ -183,6 +183,7 @@ class Trainer:
             self.optimizer, cfg, steps_per_epoch=len(self.train_loader)
         )
         self.scaler    = GradScaler(enabled=cfg.train.use_amp)
+        self.criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
         # ---- Logging (rank 0 only) ----
         self.output_dir = Path(cfg.train.output_dir)
@@ -207,6 +208,7 @@ class Trainer:
 
         total_loss = 0.0
         n_plateau  = 0.0
+        n_verb_correct = n_noun_correct = n_samples = 0
         t0 = time.time()
 
         video_states: Dict[str, dict] = {}
@@ -214,8 +216,11 @@ class Trainer:
 
         for step, batch in enumerate(self.train_loader):
             pixel_values = batch["pixel_values"].to(self.device)
+            verb_labels  = batch["verb_labels"].to(self.device)
+            noun_labels  = batch["noun_labels"].to(self.device)
             uids         = batch["video_uids"]
             is_new       = batch["is_new_video"]
+            B            = pixel_values.size(0)
 
             # ---- Per-video streaming state ----
             states = []
@@ -230,10 +235,14 @@ class Trainer:
                 "prev_z":   torch.cat([s["prev_z"]   for s in states], dim=0),
             }
 
-            # ---- Forward + pred loss only (self-supervised) ----
+            # ---- Forward + combined loss ----
             with autocast(enabled=self.cfg.train.use_amp):
-                h, new_state, aux = self.model(pixel_values, batch_state)
-                loss = aux["pred_loss"] / self.cfg.train.grad_accum_steps
+                verb_logits, noun_logits, new_state, aux = self.model(pixel_values, batch_state)
+                task_loss = (
+                    self.criterion(verb_logits, verb_labels) +
+                    self.criterion(noun_logits, noun_labels)
+                )
+                loss = (task_loss + 0.1 * aux["pred_loss"]) / self.cfg.train.grad_accum_steps
 
             self.scaler.scale(loss).backward()
 
@@ -250,19 +259,27 @@ class Trainer:
                 self.optimizer.zero_grad()
 
             # ---- Metrics ----
-            total_loss += loss.item() * self.cfg.train.grad_accum_steps
-            n_plateau  += aux["plateau_rate"]
+            total_loss     += loss.item() * self.cfg.train.grad_accum_steps
+            n_plateau      += aux["plateau_rate"]
+            n_verb_correct += (verb_logits.argmax(-1) == verb_labels).sum().item()
+            n_noun_correct += (noun_logits.argmax(-1) == noun_labels).sum().item()
+            n_samples      += B
             self.global_step += 1
 
             if is_main_process() and self.global_step % self.cfg.train.log_every == 0:
-                avg_loss    = all_reduce_mean(total_loss / (step + 1), self.device)
-                avg_plateau = all_reduce_mean(n_plateau  / (step + 1), self.device)
+                avg_loss      = all_reduce_mean(total_loss     / (step + 1),       self.device)
+                avg_plateau   = all_reduce_mean(n_plateau      / (step + 1),       self.device)
+                avg_verb_acc  = all_reduce_mean(n_verb_correct / max(1, n_samples), self.device)
+                avg_noun_acc  = all_reduce_mean(n_noun_correct / max(1, n_samples), self.device)
                 lr = self.optimizer.param_groups[-1]["lr"]
-                self.writer.add_scalar("train/loss",         avg_loss,    self.global_step)
+                self.writer.add_scalar("train/loss",      avg_loss,     self.global_step)
+                self.writer.add_scalar("train/verb_acc",  avg_verb_acc, self.global_step)
+                self.writer.add_scalar("train/noun_acc",  avg_noun_acc, self.global_step)
                 self.writer.add_scalar("train/plateau_rate", avg_plateau, self.global_step)
-                self.writer.add_scalar("train/lr",           lr,          self.global_step)
+                self.writer.add_scalar("train/lr",        lr,           self.global_step)
                 logger.info(
                     f"[Ep {epoch} | Step {step}] loss={avg_loss:.4f}  "
+                    f"verb={avg_verb_acc:.3f}  noun={avg_noun_acc:.3f}  "
                     f"plateau={avg_plateau:.3f}  lr={lr:.2e}  elapsed={time.time()-t0:.1f}s"
                 )
 
@@ -276,12 +293,16 @@ class Trainer:
     def _val_epoch(self, epoch: int) -> Dict:
         self.model.eval()
         total_loss = 0.0
+        n_verb_correct = n_noun_correct = n_samples = 0
         video_states: Dict[str, dict] = {}
 
         for batch in self.val_loader:
             pixel_values = batch["pixel_values"].to(self.device)
+            verb_labels  = batch["verb_labels"].to(self.device)
+            noun_labels  = batch["noun_labels"].to(self.device)
             uids         = batch["video_uids"]
             is_new       = batch["is_new_video"]
+            B            = pixel_values.size(0)
 
             states = []
             for i, uid in enumerate(uids):
@@ -296,17 +317,29 @@ class Trainer:
             }
 
             with autocast(enabled=self.cfg.train.use_amp):
-                h, new_state, aux = self.model(pixel_values, batch_state)
-                total_loss += aux["pred_loss"].item() if isinstance(aux["pred_loss"], torch.Tensor) else aux["pred_loss"]
+                verb_logits, noun_logits, new_state, aux = self.model(pixel_values, batch_state)
+                total_loss += (
+                    self.criterion(verb_logits, verb_labels) +
+                    self.criterion(noun_logits, noun_labels)
+                ).item()
+
+            n_verb_correct += (verb_logits.argmax(-1) == verb_labels).sum().item()
+            n_noun_correct += (noun_logits.argmax(-1) == noun_labels).sum().item()
+            n_samples      += B
 
             for i, uid in enumerate(uids):
                 video_states[uid] = {k: v[i:i+1].detach() for k, v in new_state.items()}
 
-        loss = all_reduce_mean(total_loss / len(self.val_loader), self.device)
+        loss      = all_reduce_mean(total_loss     / len(self.val_loader),    self.device)
+        verb_acc  = all_reduce_mean(n_verb_correct / max(1, n_samples),       self.device)
+        noun_acc  = all_reduce_mean(n_noun_correct / max(1, n_samples),       self.device)
+
         if is_main_process():
-            self.writer.add_scalar("val/pred_loss", loss, self.global_step)
-            logger.info(f"[Val Epoch {epoch}] pred_loss={loss:.4f}")
-        return {"loss": loss}
+            self.writer.add_scalar("val/loss",     loss,     self.global_step)
+            self.writer.add_scalar("val/verb_acc", verb_acc, self.global_step)
+            self.writer.add_scalar("val/noun_acc", noun_acc, self.global_step)
+            logger.info(f"[Val Epoch {epoch}] loss={loss:.4f}  verb={verb_acc:.4f}  noun={noun_acc:.4f}")
+        return {"loss": loss, "verb_acc": verb_acc, "noun_acc": noun_acc}
 
     # ------------------------------------------------------------------
     # Checkpointing (rank 0 only)
@@ -385,12 +418,13 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--num_classes",     type=int,  default=110)
-    parser.add_argument("--ego4d_root",      type=str,  default="/vision/group/ego4d_full_frames/")
+    parser.add_argument("--num_verb_classes", type=int, default=115)
+    parser.add_argument("--num_noun_classes", type=int, default=478)
+    parser.add_argument("--ego4d_root",      type=str,  default="/vision/group/ego4d/v2/clips")
     parser.add_argument("--output_dir",      type=str,  default="./runs/btsp_exp")
     parser.add_argument("--epochs",          type=int,  default=30)
     parser.add_argument("--batch_size",      type=int,  default=8)
-    parser.add_argument("--freeze_backbone", action="store_true")
+    parser.add_argument("--freeze_backbone", action="store_true", default=True)
     parser.add_argument("--resume",          type=str,  default=None)
     parser.add_argument("--distributed",     action="store_true",
                         help="Enable DDP. Launch via: torchrun --nproc_per_node=8 train.py --distributed")
@@ -407,5 +441,6 @@ if __name__ == "__main__":
     cfg.model.freeze_backbone = args.freeze_backbone
     cfg.train.resume          = args.resume
 
-    trainer = Trainer(cfg, distributed=args.distributed)
+    trainer = Trainer(cfg, num_verb_classes=args.num_verb_classes,
+                      num_noun_classes=args.num_noun_classes, distributed=args.distributed)
     trainer.train()

@@ -14,9 +14,10 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 import torch
-from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as T
-from torchvision.io import read_image
+from torch.utils.data import Dataset, DataLoader
+import decord
+from decord import VideoReader, cpu
 
 from config import DataConfig
 
@@ -66,97 +67,111 @@ class Ego4DContinuousDataset(Dataset):
         self.transform = transform or build_transforms(cfg.img_size, train=(split == "train"))
 
         self.clips = self._load_annotations()
-        print(f"\nLoaded {len(self.clips)} clips from {len(set(c['video_uid'] for c in self.clips))} videos.\n") 
-
-    def _round_down_to_stride(self, frame_num: int) -> int:
-        """Round down frame_num to nearest multiple of frame_stride."""
-        return (frame_num // self.cfg.frame_stride) * self.cfg.frame_stride  
 
     def _load_annotations(self) -> List[dict]:
         """
-        Parse Ego4D annotations using the videos -> annotated_intervals schema.
-        Returns a flat list of clip descriptors sorted by (video_uid, start_frame).
+        Parse fho_lta annotations for next-action anticipation (K=1).
+
+        Each entry provides an observed clip and the immediately following
+        action (verb_label + noun_label) as the prediction target.
+
+        Schema: data["clips"][i] has:
+          - clip_uid, video_uid
+          - clip_parent_start_sec / clip_parent_end_sec  (observed window)
+          - future_actions[0].verb_label, future_actions[0].noun_label (K=1 target)
         """
         with open(self.cfg.annotation_json) as f:
             data = json.load(f)
 
         clips = []
+        for entry in data.get("clips", []):
+            uid       = entry["video_uid"]
+            clip_uid  = entry["clip_uid"]
+            video_path = Path(self.cfg.ego4d_root) / "clips" / f"{clip_uid}.mp4"
+            if not video_path.exists():
+                continue
 
-        print(f"Parsing annotations from {self.cfg.annotation_json}...")
-        print(f"Found {len(data.get('clips', []))} videos in the annotation file.")
-        print(f"Keys for each video entry: {data.get('clips', [{}])[0].keys() if data.get('clips') else 'N/A'}")
-
-
-        for clip in data.get("clips", []):
-            uid = clip["clip_uid"]
-            frame_dir = Path(self.cfg.ego4d_root) / uid
-            if not frame_dir.exists():
-                raise FileNotFoundError(f"Frame directory {frame_dir} does not exist for clip {uid}.")
+            # K=1: take the first future action as the prediction target
+            future = entry.get("future_actions", [])
+            if not future:
+                continue
+            verb_label = future[0].get("verb_label", 0)
+            noun_label = future[0].get("noun_label", 0)
 
             clips.append({
-                "clip_uid":   uid,
-                "frame_dir":   str(frame_dir),
-                "start_frame": clip["interval_start_frame"],
-                "end_frame":   clip["interval_end_frame"],
-                "label":       clip["verb_label"],   # swap for a real label field if available
+                "video_path":  str(video_path),
+                "video_uid":   uid,
+                "clip_uid":    clip_uid,
+                "start_sec":   entry["clip_parent_start_sec"],
+                "end_sec":     entry["clip_parent_end_sec"],
+                "verb_label":  verb_label,
+                "noun_label":  noun_label,
             })
 
         # Sort so same-video chunks are contiguous
-        clips.sort(key=lambda x: (x["clip_uid"], x["start_frame"]))
+        clips.sort(key=lambda x: (x["video_uid"], x["start_sec"]))
 
         # Mark which clips start a new video
         prev_uid = None
         for c in clips:
-            c["is_new_video"] = c["clip_uid"] != prev_uid
-            prev_uid = c["clip_uid"]
+            c["is_new_video"] = c["video_uid"] != prev_uid
+            prev_uid = c["video_uid"]
 
         return clips
 
-    def _load_frames(self, frame_dir: str, start_frame: int, end_frame: int) -> torch.Tensor:
+    def _load_frames(self, video_path: str, start_sec: float, end_sec: float) -> torch.Tensor:
         """
-        Load `clip_len` JPG frames sampled from [start_frame, end_frame].
+        Decode `clip_len` frames uniformly sampled from [start_sec, end_sec].
         Returns tensor of shape (T, C, H, W).
         """
-        print(f"Loading frames from {frame_dir} [{start_frame}, {end_frame}]...")
-        indices = list(range(start_frame, end_frame, self.cfg.frame_stride))[: self.cfg.clip_len]
+        vr = VideoReader(video_path, ctx=cpu(0))
+        fps = vr.get_avg_fps()
 
-        # Pad if the interval is shorter than clip_len
+        start_f = int(start_sec * fps)
+        end_f   = min(int(end_sec * fps), len(vr) - 1)
+
+        total_frames = end_f - start_f
+        stride = max(self.cfg.frame_stride, total_frames // self.cfg.clip_len)
+        indices = list(range(start_f, end_f, stride))[: self.cfg.clip_len]
+
         while len(indices) < self.cfg.clip_len:
             indices.append(indices[-1])
 
-        frames = [read_image(os.path.join(frame_dir, f"frame_{i:06d}.jpg")) for i in indices]
-        return self.transform(torch.stack(frames))
+        frames = vr.get_batch(indices).asnumpy()                    # (T, H, W, C) uint8
+        frames = torch.from_numpy(frames).permute(0, 3, 1, 2)       # (T, C, H, W)
+        return self.transform(frames)
 
     def __len__(self) -> int:
         return len(self.clips)
 
     def __getitem__(self, idx: int) -> dict:
         clip = self.clips[idx]
-        frames = self._load_frames(clip["frame_dir"], 
-                                   self._round_down_to_stride(clip["start_frame"]), 
-                                   self._round_down_to_stride(clip["end_frame"]))
+        frames = self._load_frames(clip["video_path"], clip["start_sec"], clip["end_sec"])
         return {
-            "pixel_values": frames,            # (T, C, H, W)
-            "label": torch.tensor(clip["label"], dtype=torch.long),
-            "video_uid": clip["video_uid"],
+            "pixel_values": frames,
+            "verb_label":   torch.tensor(clip["verb_label"], dtype=torch.long),
+            "noun_label":   torch.tensor(clip["noun_label"], dtype=torch.long),
+            "video_uid":    clip["video_uid"],
             "is_new_video": clip["is_new_video"],
         }
 
 
 # ---------------------------------------------------------------------------
-# Collate function — handle variable-length within batch
+# Collate function
 # ---------------------------------------------------------------------------
 
 def collate_fn(batch: List[dict]) -> dict:
-    pixel_values = torch.stack([b["pixel_values"] for b in batch])  # (B, T, C, H, W)
-    labels = torch.stack([b["label"] for b in batch])
+    pixel_values = torch.stack([b["pixel_values"] for b in batch])
+    verb_labels  = torch.stack([b["verb_label"]   for b in batch])
+    noun_labels  = torch.stack([b["noun_label"]   for b in batch])
     is_new = [b["is_new_video"] for b in batch]
-    uids = [b["video_uid"] for b in batch]
+    uids   = [b["video_uid"]    for b in batch]
     return {
         "pixel_values": pixel_values,
-        "labels": labels,
+        "verb_labels":  verb_labels,
+        "noun_labels":  noun_labels,
         "is_new_video": is_new,
-        "video_uids": uids,
+        "video_uids":   uids,
     }
 
 

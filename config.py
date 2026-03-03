@@ -29,13 +29,17 @@ class BTSPConfig:
 @dataclass
 class ModelConfig:
     # ------- Backbone -------
-    backbone: str = "MCG-NJU/videomae-base"   # HuggingFace VideoMAE checkpoint
-    freeze_backbone: bool = True
+    backbone: str = "MCG-NJU/videomae-base"
+    freeze_backbone: bool = True          # pretrained — freeze during fine-tuning
     embed_dim: int = 768
 
     # ------- Predictive Head -------
     pred_hidden: int = 512
     pred_layers: int = 2
+
+    # ------- Task heads -------
+    num_verb_classes: int = 115           # from fho_lta_taxonomy.json
+    num_noun_classes: int = 478           # from fho_lta_taxonomy.json
 
     # ------- BTSP -------
     btsp: BTSPConfig = field(default_factory=BTSPConfig)
@@ -46,10 +50,11 @@ class ModelConfig:
 
 @dataclass
 class DataConfig:
-    ego4d_root: str = "/vision/group/ego4d_full_frames/"
+    ego4d_root: str = "/vision/group/ego4d/v2/clips"
     annotation_json: str = "/vision/group/ego4d/v2/annotations/fho_lta_train.json"
-    clip_len: int = 16          # frames per clip fed to backbone
-    frame_stride: int = 15       # temporal stride when sampling frames
+    val_annotation_json: str = "/vision/group/ego4d/v2/annotations/fho_lta_val.json"
+    clip_len: int = 16
+    frame_stride: int = 2
     img_size: int = 224
     num_workers: int = 8
     pin_memory: bool = True

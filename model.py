@@ -104,7 +104,7 @@ class BTSPVideoTransformer(nn.Module):
             loss.backward()
     """
 
-    def __init__(self, cfg: ModelConfig):
+    def __init__(self, cfg: ModelConfig, num_verb_classes: int, num_noun_classes: int):
         super().__init__()
         self.cfg = cfg
         btsp_cfg = cfg.btsp
@@ -123,16 +123,24 @@ class BTSPVideoTransformer(nn.Module):
         )
 
         # ---- BTSP Components ----
-        self.trace = EligibilityTrace(btsp_cfg)
+        self.trace   = EligibilityTrace(btsp_cfg)
         self.plateau = PlateauDetector(btsp_cfg)
-        self.memory = BTSPMemoryBank(btsp_cfg)
+        self.memory  = BTSPMemoryBank(btsp_cfg)
 
         # ---- Fusion ----
         fusion_map = {"concat": ConcatFusion, "gate": GateFusion, "add": AddFusion}
         fusion_cls = fusion_map[cfg.fusion]
         self.fusion = fusion_cls(cfg.embed_dim) if cfg.fusion != "add" else AddFusion()
 
-        # No classifier — evaluation is done via a separate linear probe (see linear_probe.py)
+        # ---- Separate verb and noun heads ----
+        self.verb_head = nn.Sequential(
+            nn.LayerNorm(cfg.embed_dim),
+            nn.Linear(cfg.embed_dim, num_verb_classes),
+        )
+        self.noun_head = nn.Sequential(
+            nn.LayerNorm(cfg.embed_dim),
+            nn.Linear(cfg.embed_dim, num_noun_classes),
+        )
 
     # ------------------------------------------------------------------
     # State management
@@ -210,23 +218,25 @@ class BTSPVideoTransformer(nn.Module):
         # ---- 7. Fusion ----
         h = self.fusion(z, retrieved)    # (B, D)
 
-        # No classifier here — call linear_probe.py for downstream eval
+        # ---- 8. Anticipation heads ----
+        verb_logits = self.verb_head(h)  # (B, num_verb_classes)
+        noun_logits = self.noun_head(h)  # (B, num_noun_classes)
 
         # ---- Update state ----
         new_state = {
-            "trace": new_trace,
+            "trace":    new_trace,
             "cooldown": new_cooldown,
-            "prev_z": z.detach(),
+            "prev_z":   z.detach(),
         }
 
         aux = {
-            "pred_loss": pred_loss,
+            "pred_loss":    pred_loss,
             "plateau_rate": plateau_mask.float().mean().item(),
-            "n_writes": n_writes,
-            "surprise": surprise.mean().item(),
+            "n_writes":     n_writes,
+            "surprise":     surprise.mean().item(),
         }
 
-        return h, new_state, aux
+        return verb_logits, noun_logits, new_state, aux
 
 
 # ---------------------------------------------------------------------------
