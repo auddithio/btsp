@@ -38,8 +38,8 @@ class ModelConfig:
     pred_layers: int = 2
 
     # ------- Task heads -------
-    num_verb_classes: int = 115           # from fho_lta_taxonomy.json
-    num_noun_classes: int = 478           # from fho_lta_taxonomy.json
+    num_verb_classes: int = 117           # from fho_lta_taxonomy.json
+    num_noun_classes: int = 521           # from fho_lta_taxonomy.json
 
     # ------- BTSP -------
     btsp: BTSPConfig = field(default_factory=BTSPConfig)

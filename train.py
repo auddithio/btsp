@@ -418,9 +418,9 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--num_verb_classes", type=int, default=115)
-    parser.add_argument("--num_noun_classes", type=int, default=478)
-    parser.add_argument("--ego4d_root",      type=str,  default="/vision/group/ego4d/v2/clips")
+    parser.add_argument("--num_verb_classes", type=int, default=117)
+    parser.add_argument("--num_noun_classes", type=int, default=521)
+    parser.add_argument("--ego4d_root",      type=str,  default="/vision/group/ego4d/v1/clips")
     parser.add_argument("--output_dir",      type=str,  default="./runs/btsp_exp")
     parser.add_argument("--epochs",          type=int,  default=30)
     parser.add_argument("--batch_size",      type=int,  default=8)
