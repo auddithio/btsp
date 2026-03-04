@@ -8,10 +8,12 @@ the model must accumulate memory across chunks within the same video.
 """
 
 import json
+import csv
 import os
 import random
 from pathlib import Path
 from typing import List, Optional, Tuple
+from torchvision.io import read_image
 
 import torch
 import torchvision.transforms as T
@@ -83,12 +85,16 @@ class Ego4DContinuousDataset(Dataset):
         with open(self.cfg.annotation_json) as f:
             data = json.load(f)
 
+        print(f"Parsing annotations from {self.cfg.annotation_json}...")
+        print(f"Found {len(data.get('clips', []))} annotated clips in total (before filtering).")
+
         clips = []
         for entry in data.get("clips", []):
             uid       = entry["video_uid"]
             clip_uid  = entry["clip_uid"]
             video_path = Path(self.cfg.ego4d_root) / "clips" / f"{clip_uid}.mp4"
             if not video_path.exists():
+                print(f"Warning: video file {video_path} not found, skipping clip {clip_uid}")
                 continue
 
             # K=1: take the first future action as the prediction target
@@ -107,6 +113,8 @@ class Ego4DContinuousDataset(Dataset):
                 "verb_label":  verb_label,
                 "noun_label":  noun_label,
             })
+
+        print(f"Loaded {len(clips)} clips for split '{self.split}'")
 
         # Sort so same-video chunks are contiguous
         clips.sort(key=lambda x: (x["video_uid"], x["start_sec"]))
@@ -154,6 +162,109 @@ class Ego4DContinuousDataset(Dataset):
             "video_uid":    clip["video_uid"],
             "is_new_video": clip["is_new_video"],
         }
+    
+class EpicKitchensAnticipationDataset(Dataset):
+    """
+    EPIC-KITCHENS-100 next-action anticipation (K=1).
+
+    Each item is a clip of frames ending τ_a seconds before an annotated
+    action starts, with verb_class and noun_class as prediction targets.
+    Clips are sorted by (video_id, start_frame) for BTSP streaming continuity.
+    """
+
+    ANTICIPATION_GAP_SEC: float = 1.0   # τ_a: standard EK-100 setting
+    OBSERVED_SEC: float = 2.0           # duration of observed window
+    FPS: float = 60.0                   # EK-100 is 60fps
+
+    def __init__(
+        self,
+        cfg: DataConfig,
+        split: str = "train",
+        transform: Optional[T.Compose] = None,
+    ):
+        self.cfg = cfg
+        self.split = split
+        self.transform = transform or build_transforms(cfg.img_size, train=(split == "train"))
+        self.clips = self._load_annotations()
+
+    def _load_annotations(self) -> List[dict]:
+        """
+        Parse EPIC_100_{train|validation}.csv.
+        Key columns: video_id, start_frame, stop_frame, verb_class, noun_class.
+        """
+        csv_name = "EPIC_100_train.csv" if self.split == "train" else "EPIC_100_validation.csv"
+        csv_path = Path(self.cfg.annotation_json) / csv_name
+
+        clips = []
+        with open(csv_path, newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                vid = row["video_id"]               # e.g. "P01_101"
+                pid = row["participant_id"]          # e.g. "P01"
+
+                frame_dir = Path(self.cfg.ego4d_root) / pid / vid
+                if not frame_dir.exists():
+                    print(f"Warning: frame directory {frame_dir} not found, skipping video {vid}")
+                    continue
+
+                action_start_frame = int(row["start_frame"])
+                obs_end_frame   = max(0, action_start_frame - int(self.ANTICIPATION_GAP_SEC * self.FPS))
+                obs_start_frame = max(0, obs_end_frame      - int(self.OBSERVED_SEC          * self.FPS))
+
+                if obs_end_frame <= obs_start_frame:
+                    continue
+
+                clips.append({
+                    "video_id":        vid,
+                    "frame_dir":       str(frame_dir),
+                    "obs_start_frame": obs_start_frame,
+                    "obs_end_frame":   obs_end_frame,
+                    "verb_label":      int(row["verb_class"]),
+                    "noun_label":      int(row["noun_class"]),
+                })
+
+        print(f"Loaded {len(clips)} clips for split '{self.split}'")
+
+        clips.sort(key=lambda x: (x["video_id"], x["obs_start_frame"]))
+
+        prev_vid = None
+        for c in clips:
+            c["is_new_video"] = c["video_id"] != prev_vid
+            prev_vid = c["video_id"]
+
+        return clips
+
+    def _load_frames(self, frame_dir: str, start_frame: int, end_frame: int) -> torch.Tensor:
+        """
+        Load clip_len frames from pre-extracted JPGs.
+        EK-100 filenames: frame_0000000001.jpg (10-digit, 1-indexed).
+        Returns (T, C, H, W).
+        """
+        indices = list(range(start_frame, end_frame, self.cfg.frame_stride))[: self.cfg.clip_len]
+        while len(indices) < self.cfg.clip_len:
+            indices.append(indices[-1])
+
+        frames = [
+            read_image(str(Path(frame_dir) / f"frame_{i:010d}.jpg"))
+            for i in indices
+        ]
+        return self.transform(torch.stack(frames))
+
+    def __len__(self) -> int:
+        return len(self.clips)
+
+    def __getitem__(self, idx: int) -> dict:
+        clip = self.clips[idx]
+        frames = self._load_frames(
+            clip["frame_dir"], clip["obs_start_frame"], clip["obs_end_frame"]
+        )
+        return {
+            "pixel_values": frames,
+            "verb_label":   torch.tensor(clip["verb_label"], dtype=torch.long),
+            "noun_label":   torch.tensor(clip["noun_label"], dtype=torch.long),
+            "video_uid":    clip["video_id"],
+            "is_new_video": clip["is_new_video"],
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -161,17 +272,12 @@ class Ego4DContinuousDataset(Dataset):
 # ---------------------------------------------------------------------------
 
 def collate_fn(batch: List[dict]) -> dict:
-    pixel_values = torch.stack([b["pixel_values"] for b in batch])
-    verb_labels  = torch.stack([b["verb_label"]   for b in batch])
-    noun_labels  = torch.stack([b["noun_label"]   for b in batch])
-    is_new = [b["is_new_video"] for b in batch]
-    uids   = [b["video_uid"]    for b in batch]
     return {
-        "pixel_values": pixel_values,
-        "verb_labels":  verb_labels,
-        "noun_labels":  noun_labels,
-        "is_new_video": is_new,
-        "video_uids":   uids,
+        "pixel_values": torch.stack([b["pixel_values"] for b in batch]),
+        "verb_labels":  torch.stack([b["verb_label"]   for b in batch]),
+        "noun_labels":  torch.stack([b["noun_label"]   for b in batch]),
+        "is_new_video": [b["is_new_video"] for b in batch],
+        "video_uids":   [b["video_uid"]    for b in batch],
     }
 
 
@@ -180,10 +286,10 @@ def collate_fn(batch: List[dict]) -> dict:
 # ---------------------------------------------------------------------------
 
 def build_dataloader(cfg: DataConfig, split: str, shuffle: bool = True) -> DataLoader:
-    dataset = Ego4DContinuousDataset(cfg, split=split)
+    dataset = EpicKitchensAnticipationDataset(cfg, split=split)
     return DataLoader(
         dataset,
-        batch_size=1,                   # actual batching handled in trainer
+        batch_size=cfg.batch_size,
         shuffle=shuffle and (split == "train"),
         num_workers=cfg.num_workers,
         pin_memory=cfg.pin_memory,

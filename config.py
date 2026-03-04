@@ -38,8 +38,8 @@ class ModelConfig:
     pred_layers: int = 2
 
     # ------- Task heads -------
-    num_verb_classes: int = 117           # from fho_lta_taxonomy.json
-    num_noun_classes: int = 521           # from fho_lta_taxonomy.json
+    num_verb_classes: int = 97            # EPIC-KITCHENS-100 verb classes
+    num_noun_classes: int = 300           # EPIC-KITCHENS-100 noun classes
 
     # ------- BTSP -------
     btsp: BTSPConfig = field(default_factory=BTSPConfig)
@@ -50,14 +50,15 @@ class ModelConfig:
 
 @dataclass
 class DataConfig:
-    ego4d_root: str = "/vision/group/ego4d/v2/clips"
-    annotation_json: str = "/vision/group/ego4d/v2/annotations/fho_lta_train.json"
-    val_annotation_json: str = "/vision/group/ego4d/v2/annotations/fho_lta_val.json"
+    ego4d_root: str = "/scr/aunag/ek100_frames"          # extracted RGB frames root
+    annotation_json: str = "/scr/aunag/annotations"       # dir containing EPIC_100_train.csv etc.
+    val_annotation_json: str = "/scr/aunag/annotations"
     clip_len: int = 16
-    frame_stride: int = 2
+    frame_stride: int = 4                                  # 60fps → every 4th frame ≈ 15fps effective
     img_size: int = 224
     num_workers: int = 8
     pin_memory: bool = True
+    batch_size: int = 8
 
 
 @dataclass
