@@ -44,7 +44,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from config import ExperimentConfig
 from model import BTSPVideoTransformer
-from dataset import build_dataloader, Ego4DContinuousDataset, collate_fn
+from dataset import build_dataloader, EpicKitchensAnticipationDataset, collate_fn
 from torch.utils.data import DataLoader
 
 logger = logging.getLogger(__name__)
@@ -78,7 +78,7 @@ def all_reduce_mean(value: float, device: torch.device) -> float:
 
 
 def build_distributed_dataloader(cfg, split: str) -> DataLoader:
-    dataset = Ego4DContinuousDataset(cfg, split=split)
+    dataset = EpicKitchensAnticipationDataset(cfg, split=split)
     sampler = DistributedSampler(
         dataset,
         num_replicas=dist.get_world_size(),

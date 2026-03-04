@@ -50,11 +50,12 @@ class ModelConfig:
 
 @dataclass
 class DataConfig:
-    ego4d_root: str = "/scr/aunag/ek100_frames"          # extracted RGB frames root
-    annotation_json: str = "/scr/aunag/annotations"       # dir containing EPIC_100_train.csv etc.
+    ego4d_root: str = "/scr/aunag/ek100_frames"
+    annotation_json: str = "/scr/aunag/annotations"
     val_annotation_json: str = "/scr/aunag/annotations"
+    frame_cache_path: str = "/scr/aunag/frame_cache.json"   # pre-computed by precompute_cache.py
     clip_len: int = 16
-    frame_stride: int = 4                                  # 60fps → every 4th frame ≈ 15fps effective
+    frame_stride: int = 4
     img_size: int = 224
     num_workers: int = 8
     pin_memory: bool = True

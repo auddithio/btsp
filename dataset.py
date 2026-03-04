@@ -1,25 +1,35 @@
 """
-dataset.py — Ego4D continuous video stream dataset.
+dataset.py — EPIC-KITCHENS-100 action anticipation dataset.
 
-Unlike clip-based datasets, we treat each Ego4D recording as a long,
-unsegmented stream and yield fixed-length chunks sequentially.
-This is the regime where BTSP is algorithmically relevant:
-the model must accumulate memory across chunks within the same video.
+Uses pre-extracted RGB frames (from .tar archives) for fast O(1) random
+access during training, avoiding decord seek overhead on MP4s.
+
+Directory structure (after extraction):
+  {ek_frames_root}/
+    P01/
+      P01_101/
+        frame_0000000001.jpg
+        frame_0000000002.jpg
+        ...
+    P02/
+      ...
+
+Annotations (from epic-kitchens-100-annotations repo):
+  {annotations_root}/EPIC_100_train.csv
+  {annotations_root}/EPIC_100_validation.csv
+
+Anticipation protocol:
+  Observed clip ends τ_a=1.0s before action start; model predicts verb+noun.
 """
 
-import json
 import csv
-import os
-import random
 from pathlib import Path
-from typing import List, Optional, Tuple
-from torchvision.io import read_image
+from typing import List, Optional
 
 import torch
 import torchvision.transforms as T
+from torchvision.io import read_image
 from torch.utils.data import Dataset, DataLoader
-import decord
-from decord import VideoReader, cpu
 
 from config import DataConfig
 
@@ -41,128 +51,9 @@ def build_transforms(img_size: int, train: bool) -> T.Compose:
 
 
 # ---------------------------------------------------------------------------
-# Clip sampler — yields (clip_tensor, label, is_new_video) tuples
+# Dataset
 # ---------------------------------------------------------------------------
 
-class Ego4DContinuousDataset(Dataset):
-    """
-    Treats each Ego4D video as a contiguous stream.
-    Each __getitem__ call returns one chunk of `clip_len` frames, sampled
-    with stride `frame_stride`, along with its action label and a flag
-    indicating whether this chunk starts a new video (so the caller can
-    reset memory state).
-
-    Args:
-        cfg:        DataConfig
-        split:      "train" | "val" | "test"
-        transform:  optional override
-    """
-
-    def __init__(
-        self,
-        cfg: DataConfig,
-        split: str = "train",
-        transform: Optional[T.Compose] = None,
-    ):
-        self.cfg = cfg
-        self.split = split
-        self.transform = transform or build_transforms(cfg.img_size, train=(split == "train"))
-
-        self.clips = self._load_annotations()
-
-    def _load_annotations(self) -> List[dict]:
-        """
-        Parse fho_lta annotations for next-action anticipation (K=1).
-
-        Each entry provides an observed clip and the immediately following
-        action (verb_label + noun_label) as the prediction target.
-
-        Schema: data["clips"][i] has:
-          - clip_uid, video_uid
-          - clip_parent_start_sec / clip_parent_end_sec  (observed window)
-          - future_actions[0].verb_label, future_actions[0].noun_label (K=1 target)
-        """
-        with open(self.cfg.annotation_json) as f:
-            data = json.load(f)
-
-        print(f"Parsing annotations from {self.cfg.annotation_json}...")
-        print(f"Found {len(data.get('clips', []))} annotated clips in total (before filtering).")
-
-        clips = []
-        for entry in data.get("clips", []):
-            uid       = entry["video_uid"]
-            clip_uid  = entry["clip_uid"]
-            video_path = Path(self.cfg.ego4d_root) / "clips" / f"{clip_uid}.mp4"
-            if not video_path.exists():
-                print(f"Warning: video file {video_path} not found, skipping clip {clip_uid}")
-                continue
-
-            # K=1: take the first future action as the prediction target
-            future = entry.get("future_actions", [])
-            if not future:
-                continue
-            verb_label = future[0].get("verb_label", 0)
-            noun_label = future[0].get("noun_label", 0)
-
-            clips.append({
-                "video_path":  str(video_path),
-                "video_uid":   uid,
-                "clip_uid":    clip_uid,
-                "start_sec":   entry["clip_parent_start_sec"],
-                "end_sec":     entry["clip_parent_end_sec"],
-                "verb_label":  verb_label,
-                "noun_label":  noun_label,
-            })
-
-        print(f"Loaded {len(clips)} clips for split '{self.split}'")
-
-        # Sort so same-video chunks are contiguous
-        clips.sort(key=lambda x: (x["video_uid"], x["start_sec"]))
-
-        # Mark which clips start a new video
-        prev_uid = None
-        for c in clips:
-            c["is_new_video"] = c["video_uid"] != prev_uid
-            prev_uid = c["video_uid"]
-
-        return clips
-
-    def _load_frames(self, video_path: str, start_sec: float, end_sec: float) -> torch.Tensor:
-        """
-        Decode `clip_len` frames uniformly sampled from [start_sec, end_sec].
-        Returns tensor of shape (T, C, H, W).
-        """
-        vr = VideoReader(video_path, ctx=cpu(0))
-        fps = vr.get_avg_fps()
-
-        start_f = int(start_sec * fps)
-        end_f   = min(int(end_sec * fps), len(vr) - 1)
-
-        total_frames = end_f - start_f
-        stride = max(self.cfg.frame_stride, total_frames // self.cfg.clip_len)
-        indices = list(range(start_f, end_f, stride))[: self.cfg.clip_len]
-
-        while len(indices) < self.cfg.clip_len:
-            indices.append(indices[-1])
-
-        frames = vr.get_batch(indices).asnumpy()                    # (T, H, W, C) uint8
-        frames = torch.from_numpy(frames).permute(0, 3, 1, 2)       # (T, C, H, W)
-        return self.transform(frames)
-
-    def __len__(self) -> int:
-        return len(self.clips)
-
-    def __getitem__(self, idx: int) -> dict:
-        clip = self.clips[idx]
-        frames = self._load_frames(clip["video_path"], clip["start_sec"], clip["end_sec"])
-        return {
-            "pixel_values": frames,
-            "verb_label":   torch.tensor(clip["verb_label"], dtype=torch.long),
-            "noun_label":   torch.tensor(clip["noun_label"], dtype=torch.long),
-            "video_uid":    clip["video_uid"],
-            "is_new_video": clip["is_new_video"],
-        }
-    
 class EpicKitchensAnticipationDataset(Dataset):
     """
     EPIC-KITCHENS-100 next-action anticipation (K=1).
@@ -185,7 +76,25 @@ class EpicKitchensAnticipationDataset(Dataset):
         self.cfg = cfg
         self.split = split
         self.transform = transform or build_transforms(cfg.img_size, train=(split == "train"))
+        self._frame_cache = self._load_frame_cache()
         self.clips = self._load_annotations()
+
+    def _load_frame_cache(self) -> dict:
+        """
+        Load pre-computed frame cache from disk (keyed by video_id).
+        Run precompute_cache.py once before training to generate this file.
+        """
+        cache_path = Path(self.cfg.frame_cache_path)
+        if not cache_path.exists():
+            raise FileNotFoundError(
+                f"Frame cache not found at {cache_path}. "
+                f"Run 'python precompute_cache.py' first."
+            )
+        import json
+        with open(cache_path) as f:
+            raw = json.load(f)
+        # Re-key from "pid/vid" -> "vid" for fast lookup
+        return {k.split("/")[1]: v for k, v in raw.items()}
 
     def _load_annotations(self) -> List[dict]:
         """
@@ -199,17 +108,26 @@ class EpicKitchensAnticipationDataset(Dataset):
         with open(csv_path, newline="") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                vid = row["video_id"]               # e.g. "P01_101"
-                pid = row["participant_id"]          # e.g. "P01"
+                vid = row["video_id"]
+                pid = row["participant_id"]
 
                 frame_dir = Path(self.cfg.ego4d_root) / pid / vid
                 if not frame_dir.exists():
-                    print(f"Warning: frame directory {frame_dir} not found, skipping video {vid}")
                     continue
 
+                available = self._frame_cache.get(vid, [])
+                if not available:
+                    continue
+
+                first_f = available[0]
+                last_f  = available[-1]
+
                 action_start_frame = int(row["start_frame"])
-                obs_end_frame   = max(0, action_start_frame - int(self.ANTICIPATION_GAP_SEC * self.FPS))
-                obs_start_frame = max(0, obs_end_frame      - int(self.OBSERVED_SEC          * self.FPS))
+                obs_end_frame   = max(first_f, min(
+                    action_start_frame - int(self.ANTICIPATION_GAP_SEC * self.FPS),
+                    last_f,
+                ))
+                obs_start_frame = max(first_f, obs_end_frame - int(self.OBSERVED_SEC * self.FPS))
 
                 if obs_end_frame <= obs_start_frame:
                     continue
@@ -223,8 +141,6 @@ class EpicKitchensAnticipationDataset(Dataset):
                     "noun_label":      int(row["noun_class"]),
                 })
 
-        print(f"Loaded {len(clips)} clips for split '{self.split}'")
-
         clips.sort(key=lambda x: (x["video_id"], x["obs_start_frame"]))
 
         prev_vid = None
@@ -232,22 +148,47 @@ class EpicKitchensAnticipationDataset(Dataset):
             c["is_new_video"] = c["video_id"] != prev_vid
             prev_vid = c["video_id"]
 
+        # Store cache on instance so _load_frames can use it
+        self._frame_cache = frame_cache
         return clips
 
     def _load_frames(self, frame_dir: str, start_frame: int, end_frame: int) -> torch.Tensor:
         """
-        Load clip_len frames from pre-extracted JPGs.
-        EK-100 filenames: frame_0000000001.jpg (10-digit, 1-indexed).
+        Load clip_len frames sampled only from frames that exist on disk.
+        Uses the pre-built frame cache to avoid any missing-file errors.
         Returns (T, C, H, W).
         """
-        indices = list(range(start_frame, end_frame, self.cfg.frame_stride))[: self.cfg.clip_len]
-        while len(indices) < self.cfg.clip_len:
-            indices.append(indices[-1])
+        vid = Path(frame_dir).name
+        available = self._frame_cache.get(vid, [])
+        # Filter to frames within the requested window
+        window = [f for f in available if start_frame <= f <= end_frame]
 
-        frames = [
-            read_image(str(Path(frame_dir) / f"frame_{i:010d}.jpg"))
-            for i in indices
-        ]
+        # Fall back to nearest available frames if window is empty
+        if not window:
+            window = available
+
+        # Subsample clip_len frames evenly across window
+        if len(window) <= self.cfg.clip_len:
+            indices = window + [window[-1]] * (self.cfg.clip_len - len(window))
+        else:
+            step = len(window) / self.cfg.clip_len
+            indices = [window[int(i * step)] for i in range(self.cfg.clip_len)]
+
+        frame_dir_path = Path(frame_dir)
+        frames = []
+        last_good = None
+        for i in indices:
+            try:
+                img = read_image(str(frame_dir_path / f"frame_{i:010d}.jpg"))
+                last_good = img
+                frames.append(img)
+            except RuntimeError:
+                # Truncated or corrupt JPEG — reuse the last good frame
+                if last_good is not None:
+                    frames.append(last_good)
+                else:
+                    # No good frame yet — use a blank
+                    frames.append(torch.zeros(3, self.cfg.img_size, self.cfg.img_size, dtype=torch.uint8))
         return self.transform(torch.stack(frames))
 
     def __len__(self) -> int:
@@ -268,7 +209,7 @@ class EpicKitchensAnticipationDataset(Dataset):
 
 
 # ---------------------------------------------------------------------------
-# Collate function
+# Collate + DataLoader
 # ---------------------------------------------------------------------------
 
 def collate_fn(batch: List[dict]) -> dict:
@@ -280,10 +221,6 @@ def collate_fn(batch: List[dict]) -> dict:
         "video_uids":   [b["video_uid"]    for b in batch],
     }
 
-
-# ---------------------------------------------------------------------------
-# DataLoader factory
-# ---------------------------------------------------------------------------
 
 def build_dataloader(cfg: DataConfig, split: str, shuffle: bool = True) -> DataLoader:
     dataset = EpicKitchensAnticipationDataset(cfg, split=split)
