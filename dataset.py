@@ -148,8 +148,6 @@ class EpicKitchensAnticipationDataset(Dataset):
             c["is_new_video"] = c["video_id"] != prev_vid
             prev_vid = c["video_id"]
 
-        # Store cache on instance so _load_frames can use it
-        self._frame_cache = frame_cache
         return clips
 
     def _load_frames(self, frame_dir: str, start_frame: int, end_frame: int) -> torch.Tensor:
@@ -232,4 +230,5 @@ def build_dataloader(cfg: DataConfig, split: str, shuffle: bool = True) -> DataL
         pin_memory=cfg.pin_memory,
         collate_fn=collate_fn,
         prefetch_factor=2,
+        drop_last=True,   # ensures all ranks get identical batch counts in DDP
     )

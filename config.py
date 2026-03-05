@@ -25,6 +25,15 @@ class BTSPConfig:
     # ------- Readout -------
     readout_hidden: int = 512
 
+    # ------- Ablation mode -------
+    # "full"   : standard BTSP — eligibility traces written on plateau events (default)
+    # "random" : matched-rate ablation — random noise written at same rate as plateau
+    #            events; destroys the content and timing of writes while keeping
+    #            identical architecture and parameter count
+    # "frozen" : memory bank never written — always returns zeros through fusion;
+    #            isolates the contribution of the fusion layer alone
+    ablation_mode: str = "full"
+
 
 @dataclass
 class ModelConfig:

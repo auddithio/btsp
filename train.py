@@ -345,22 +345,34 @@ class Trainer:
     # Checkpointing (rank 0 only)
     # ------------------------------------------------------------------
 
-    def _save_checkpoint(self, epoch: int, metrics: dict):
+    def _save_checkpoint(self, epoch: int, metrics: dict, tag: str = None):
         if not is_main_process():
             return
         ckpt = {
             "epoch":       epoch,
             "global_step": self.global_step,
-            "model":       self.raw_model.state_dict(),  # save unwrapped weights
+            "model":       self.raw_model.state_dict(),
             "optimizer":   self.optimizer.state_dict(),
             "scheduler":   self.scheduler.state_dict(),
             "scaler":      self.scaler.state_dict(),
             "metrics":     metrics,
             "config":      self.cfg,
         }
-        path = self.output_dir / f"checkpoint_epoch{epoch:03d}.pt"
+        if tag:
+            # Named checkpoint e.g. "best" — always overwrite
+            path = self.output_dir / f"checkpoint_{tag}.pt"
+        else:
+            path = self.output_dir / f"checkpoint_epoch{epoch:03d}.pt"
+
         torch.save(ckpt, path)
         logger.info(f"Saved checkpoint → {path}")
+
+        # Keep only the last 3 periodic (non-tagged) checkpoints to save disk
+        if not tag:
+            old = sorted(self.output_dir.glob("checkpoint_epoch*.pt"))
+            for old_ckpt in old[:-3]:
+                old_ckpt.unlink()
+                logger.info(f"Removed old checkpoint {old_ckpt.name}")
 
     def _load_checkpoint(self, path: str):
         ckpt = torch.load(path, map_location=self.device)
@@ -369,6 +381,7 @@ class Trainer:
         self.scheduler.load_state_dict(ckpt["scheduler"])
         self.scaler.load_state_dict(ckpt["scaler"])
         self.global_step = ckpt["global_step"]
+        self.start_epoch = ckpt["epoch"] + 1
         if is_main_process():
             logger.info(f"Resumed from {path} (epoch {ckpt['epoch']})")
 
@@ -379,29 +392,39 @@ class Trainer:
     def train(self):
         if is_main_process():
             logger.info(f"Starting training for {self.cfg.train.epochs} epochs")
-        best_val_acc = 0.0
 
-        for epoch in range(1, self.cfg.train.epochs + 1):
+        best_val_verb_acc = 0.0
+        start_epoch = getattr(self, "start_epoch", 1)
+
+        for epoch in range(start_epoch, self.cfg.train.epochs + 1):
             train_metrics = self._train_epoch(epoch)
 
             val_metrics = {}
             if epoch % self.cfg.train.eval_every == 0:
                 val_metrics = self._val_epoch(epoch)
-                if val_metrics["acc"] > best_val_acc:
-                    best_val_acc = val_metrics["acc"]
 
+                # Save best checkpoint based on mean of verb+noun top-1 accuracy
+                mean_acc = (val_metrics.get("verb_acc", 0) + val_metrics.get("noun_acc", 0)) / 2
+                if mean_acc > best_val_verb_acc:
+                    best_val_verb_acc = mean_acc
+                    self._save_checkpoint(
+                        epoch,
+                        {**train_metrics, **{f"val_{k}": v for k, v in val_metrics.items()}},
+                        tag="best",
+                    )
+
+            # Periodic checkpoint every save_every epochs
             if epoch % self.cfg.train.save_every == 0:
                 self._save_checkpoint(
                     epoch,
-                    {**train_metrics, **{f"val_{k}": v for k, v in val_metrics.items()}}
+                    {**train_metrics, **{f"val_{k}": v for k, v in val_metrics.items()}},
                 )
 
-            # Synchronise all ranks before next epoch
             if self.distributed:
                 dist.barrier()
 
         if is_main_process():
-            logger.info(f"Training complete. Best val acc: {best_val_acc:.4f}")
+            logger.info(f"Training complete. Best mean acc: {best_val_verb_acc:.4f}")
             self.writer.close()
 
         if self.distributed:
@@ -421,11 +444,14 @@ if __name__ == "__main__":
     parser.add_argument("--num_verb_classes", type=int, default=97)
     parser.add_argument("--num_noun_classes", type=int, default=300)
     parser.add_argument("--ego4d_root",      type=str,  default="/scr/aunag/ek100_frames")
-    parser.add_argument("--output_dir",      type=str,  default="./runs/ek_linear")
+    parser.add_argument("--output_dir",      type=str,  default="./runs/btsp_exp")
     parser.add_argument("--epochs",          type=int,  default=30)
     parser.add_argument("--batch_size",      type=int,  default=8)
     parser.add_argument("--freeze_backbone", action="store_true", default=True)
     parser.add_argument("--resume",          type=str,  default=None)
+    parser.add_argument("--ablation_mode",   type=str,  default="full",
+                        choices=["full", "random", "frozen"],
+                        help="full=standard BTSP | random=matched-rate noise writes | frozen=no writes")
     parser.add_argument("--distributed",     action="store_true",
                         help="Enable DDP. Launch via: torchrun --nproc_per_node=8 train.py --distributed")
     args = parser.parse_args()
@@ -434,12 +460,13 @@ if __name__ == "__main__":
         setup_distributed()
 
     cfg = ExperimentConfig()
-    cfg.data.ego4d_root       = args.ego4d_root
-    cfg.train.output_dir      = args.output_dir
-    cfg.train.epochs          = args.epochs
-    cfg.train.batch_size      = args.batch_size
-    cfg.model.freeze_backbone = args.freeze_backbone
-    cfg.train.resume          = args.resume
+    cfg.data.ego4d_root             = args.ego4d_root
+    cfg.train.output_dir            = args.output_dir + f"_{args.ablation_mode}"
+    cfg.train.epochs                = args.epochs
+    cfg.train.batch_size            = args.batch_size
+    cfg.model.freeze_backbone       = args.freeze_backbone
+    cfg.train.resume                = args.resume
+    cfg.model.btsp.ablation_mode    = args.ablation_mode
 
     trainer = Trainer(cfg, num_verb_classes=args.num_verb_classes,
                       num_noun_classes=args.num_noun_classes, distributed=args.distributed)

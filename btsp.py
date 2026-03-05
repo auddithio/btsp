@@ -120,6 +120,12 @@ class BTSPMemoryBank(nn.Module):
 
     No gradients flow through write operations, enforcing the separation
     between slow (SGD) and fast (event-gated) learning pathways.
+
+    Ablation modes (set via BTSPConfig.ablation_mode):
+        "full"   : standard BTSP — eligibility traces written on plateau events
+        "random" : matched-rate — random noise written at same rate as plateaus;
+                   destroys content/timing while keeping identical capacity
+        "frozen" : never writes — memory always empty; isolates fusion layer
     """
 
     def __init__(self, cfg: BTSPConfig):
@@ -128,6 +134,10 @@ class BTSPMemoryBank(nn.Module):
         self.dim = cfg.memory_dim
         self.top_k = cfg.memory_top_k
         self.write_momentum = cfg.memory_write_momentum
+        self.ablation_mode = cfg.ablation_mode
+
+        assert self.ablation_mode in ("full", "random", "frozen"), \
+            f"ablation_mode must be 'full', 'random', or 'frozen', got '{self.ablation_mode}'"
 
         # Memory slots are NOT parameters; they live as buffers.
         self.register_buffer("memory", torch.zeros(cfg.memory_size, cfg.memory_dim))
@@ -141,32 +151,48 @@ class BTSPMemoryBank(nn.Module):
     @torch.no_grad()
     def write(
         self,
-        trace: torch.Tensor,      # (B, D) eligibility traces
+        trace: torch.Tensor,         # (B, D) eligibility traces
         plateau_mask: torch.Tensor,  # (B,) bool
     ) -> int:
         """
-        Write traces of samples where plateau_mask is True into memory slots.
+        Write into memory according to the current ablation mode.
         Returns the number of writes performed.
+
+        "full"   : write eligibility traces for plateau samples (standard BTSP)
+        "random" : write unit-norm random vectors at the same rate as plateaus
+        "frozen" : never write anything
         """
-        traces_to_write = trace[plateau_mask]   # (N_plateau, D)
-        n_writes = traces_to_write.size(0)
+        if self.ablation_mode == "frozen":
+            return 0
+
+        n_writes = int(plateau_mask.sum().item())
         if n_writes == 0:
             return 0
 
-        # Normalise before writing for numerically stable cosine retrieval
-        traces_normed = F.normalize(traces_to_write, dim=-1)
+        if self.ablation_mode == "random":
+            vecs_to_write = F.normalize(
+                torch.randn(n_writes, self.dim, device=trace.device), dim=-1
+            )
+        else:
+            vecs_to_write = F.normalize(trace[plateau_mask], dim=-1)
 
-        for vec in traces_normed:
-            idx = int(self.write_ptr.item()) % self.size
-            if self.write_momentum > 0 and self.filled_slots > idx:
-                self.memory[idx] = (
-                    self.write_momentum * self.memory[idx]
-                    + (1 - self.write_momentum) * vec
+        # Vectorised circular-buffer write — no Python loop over individual vectors
+        start = int(self.write_ptr.item()) % self.size
+        indices = torch.arange(start, start + n_writes, device=self.memory.device) % self.size
+
+        if self.write_momentum > 0:
+            existing_mask = indices < int(self.filled_slots.item())
+            if existing_mask.any():
+                self.memory[indices[existing_mask]] = (
+                    self.write_momentum * self.memory[indices[existing_mask]]
+                    + (1 - self.write_momentum) * vecs_to_write[existing_mask]
                 )
-            else:
-                self.memory[idx] = vec
-            self.write_ptr.add_(1)
+            if (~existing_mask).any():
+                self.memory[indices[~existing_mask]] = vecs_to_write[~existing_mask]
+        else:
+            self.memory[indices] = vecs_to_write
 
+        self.write_ptr.add_(n_writes)
         self.filled_slots = torch.clamp(
             self.filled_slots + n_writes, max=self.size
         )
@@ -183,13 +209,16 @@ class BTSPMemoryBank(nn.Module):
             retrieved: (B, D) weighted sum of top-k memory slots
             sim_scores: (B, k) cosine similarities (for auxiliary loss if needed)
         """
+        # Always project query first so key_proj always receives gradients,
+        # even when memory is empty (avoids DDP unused-parameter error)
+        query_proj = self.key_proj(query)                # (B, D)
+
         n_filled = int(self.filled_slots.item())
         if n_filled == 0:
-            # Memory is empty — return zeros
-            return torch.zeros_like(query), torch.zeros(query.size(0), self.top_k, device=query.device)
+            # Memory is empty — return zeros but keep key_proj in the graph
+            return query_proj * 0.0, torch.zeros(query.size(0), self.top_k, device=query.device)
 
         active_memory = self.memory[:n_filled]           # (M, D)
-        query_proj = self.key_proj(query)                # (B, D)
         query_normed = F.normalize(query_proj, dim=-1)   # (B, D)
 
         # Cosine similarity: (B, M)
