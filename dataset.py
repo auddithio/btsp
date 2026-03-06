@@ -81,20 +81,41 @@ class EpicKitchensAnticipationDataset(Dataset):
 
     def _load_frame_cache(self) -> dict:
         """
-        Load pre-computed frame cache from disk (keyed by video_id).
-        Run precompute_cache.py once before training to generate this file.
+        Load pre-computed frame cache from disk on rank 0 only, then broadcast
+        to all other ranks — avoids N simultaneous JSON reads spiking CPU RAM.
+        Run precompute_cache.py once before training to generate the cache file.
         """
+        import json
+        import os
+
         cache_path = Path(self.cfg.frame_cache_path)
         if not cache_path.exists():
             raise FileNotFoundError(
                 f"Frame cache not found at {cache_path}. "
                 f"Run 'python precompute_cache.py' first."
             )
-        import json
-        with open(cache_path) as f:
-            raw = json.load(f)
-        # Re-key from "pid/vid" -> "vid" for fast lookup
-        return {k.split("/")[1]: v for k, v in raw.items()}
+
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
+        # Only rank 0 reads from disk; others wait at the barrier
+        if local_rank == 0:
+            with open(cache_path) as f:
+                raw = json.load(f)
+            cache = {k.split("/")[1]: v for k, v in raw.items()}
+        else:
+            cache = None
+
+        # Broadcast from rank 0 to all ranks if running distributed
+        try:
+            import torch.distributed as dist
+            if dist.is_available() and dist.is_initialized():
+                container = [cache]
+                dist.broadcast_object_list(container, src=0)
+                cache = container[0]
+        except Exception:
+            pass  # single-GPU — no broadcast needed
+
+        return cache
 
     def _load_annotations(self) -> List[dict]:
         """
@@ -185,8 +206,18 @@ class EpicKitchensAnticipationDataset(Dataset):
                 if last_good is not None:
                     frames.append(last_good)
                 else:
-                    # No good frame yet — use a blank
-                    frames.append(torch.zeros(3, self.cfg.img_size, self.cfg.img_size, dtype=torch.uint8))
+                    # No good frame yet — defer; will be filled by next good frame
+                    frames.append(None)
+
+        # Replace any leading Nones with the first good frame
+        first_good = next((f for f in frames if f is not None), None)
+        if first_good is None:
+            # Entire clip is corrupt — return blank at expected raw size
+            blank = torch.zeros(3, 256, 456, dtype=torch.uint8)
+            frames = [blank] * self.cfg.clip_len
+        else:
+            frames = [f if f is not None else first_good for f in frames]
+
         return self.transform(torch.stack(frames))
 
     def __len__(self) -> int:
