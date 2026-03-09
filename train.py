@@ -41,6 +41,11 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.tensorboard import SummaryWriter
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
 
 from config import ExperimentConfig
 from model import BTSPVideoTransformer
@@ -193,8 +198,28 @@ class Trainer:
         if is_main_process():
             self.output_dir.mkdir(parents=True, exist_ok=True)
             self.writer = SummaryWriter(self.output_dir / "tb")
+            if WANDB_AVAILABLE and cfg.train.wandb_project:
+                wandb.init(
+                    project=cfg.train.wandb_project,
+                    name=Path(cfg.train.output_dir).name,
+                    config={
+                        "epochs":            cfg.train.epochs,
+                        "batch_size":        cfg.train.batch_size,
+                        "lr":                cfg.train.lr,
+                        "clip_len":          cfg.data.clip_len,
+                        "ablation_mode":     cfg.model.btsp.ablation_mode,
+                        "memory_size":       cfg.model.btsp.memory_size,
+                        "trace_decay":       cfg.model.btsp.trace_decay,
+                        "plateau_threshold": cfg.model.btsp.plateau_threshold,
+                    },
+                    resume="allow",
+                )
+                self.use_wandb = True
+            else:
+                self.use_wandb = False
         else:
             self.writer = None
+            self.use_wandb = False
         self.global_step = 0
 
         if cfg.train.resume:
@@ -280,6 +305,14 @@ class Trainer:
                 self.writer.add_scalar("train/noun_acc",  avg_noun_acc, self.global_step)
                 self.writer.add_scalar("train/plateau_rate", avg_plateau, self.global_step)
                 self.writer.add_scalar("train/lr",        lr,           self.global_step)
+                if self.use_wandb:
+                    wandb.log({
+                        "train/loss":         avg_loss,
+                        "train/verb_acc":     avg_verb_acc,
+                        "train/noun_acc":     avg_noun_acc,
+                        "train/plateau_rate": avg_plateau,
+                        "train/lr":           lr,
+                    }, step=self.global_step)
                 logger.info(
                     f"[Ep {epoch} | Step {step}] loss={avg_loss:.4f}  "
                     f"verb={avg_verb_acc:.3f}  noun={avg_noun_acc:.3f}  "
@@ -341,6 +374,12 @@ class Trainer:
             self.writer.add_scalar("val/loss",     loss,     self.global_step)
             self.writer.add_scalar("val/verb_acc", verb_acc, self.global_step)
             self.writer.add_scalar("val/noun_acc", noun_acc, self.global_step)
+            if self.use_wandb:
+                wandb.log({
+                    "val/loss":     loss,
+                    "val/verb_acc": verb_acc,
+                    "val/noun_acc": noun_acc,
+                }, step=self.global_step)
             logger.info(f"[Val Epoch {epoch}] loss={loss:.4f}  verb={verb_acc:.4f}  noun={noun_acc:.4f}")
         return {"loss": loss, "verb_acc": verb_acc, "noun_acc": noun_acc}
 
@@ -429,6 +468,8 @@ class Trainer:
         if is_main_process():
             logger.info(f"Training complete. Best mean acc: {best_val_verb_acc:.4f}")
             self.writer.close()
+        if self.use_wandb:
+            wandb.finish()
 
         if self.distributed:
             cleanup_distributed()
@@ -448,6 +489,8 @@ if __name__ == "__main__":
     parser.add_argument("--num_noun_classes", type=int, default=300)
     parser.add_argument("--ego4d_root",      type=str,  default="/scr/aunag/ek100_frames")
     parser.add_argument("--output_dir",      type=str,  default="./runs/btsp_exp")
+    parser.add_argument("--wandb_project",   type=str,  default="",
+                        help="W&B project name. Leave empty to disable wandb.")
     parser.add_argument("--epochs",          type=int,  default=30)
     parser.add_argument("--batch_size",      type=int,  default=8)
     parser.add_argument("--num_workers",     type=int,  default=8)
@@ -466,6 +509,7 @@ if __name__ == "__main__":
     cfg = ExperimentConfig()
     cfg.data.ego4d_root             = args.ego4d_root
     cfg.train.output_dir            = args.output_dir + f"_{args.ablation_mode}"
+    cfg.train.wandb_project         = args.wandb_project
     cfg.train.epochs                = args.epochs
     cfg.train.batch_size            = args.batch_size
     cfg.data.batch_size             = args.batch_size

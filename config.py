@@ -78,6 +78,7 @@ class TrainConfig:
 
     # ------- Optimisation -------
     epochs: int = 30
+    batch_size: int = 8
     grad_accum_steps: int = 4
     lr: float = 1e-4
     weight_decay: float = 0.05
@@ -90,6 +91,7 @@ class TrainConfig:
     save_every: int = 5          # epochs
     use_amp: bool = True
     resume: Optional[str] = None
+    wandb_project: str = ""   # set via --wandb_project; empty = wandb disabled
 
 
 @dataclass
