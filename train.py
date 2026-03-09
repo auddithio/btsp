@@ -86,11 +86,14 @@ def build_distributed_dataloader(cfg, split: str) -> DataLoader:
         shuffle=(split == "train"),
         drop_last=True,
     )
+    # Scale workers down by world size to avoid CPU RAM exhaustion —
+    # total workers = num_workers * world_size, so keep per-GPU count low
+    workers_per_gpu = max(1, cfg.num_workers // dist.get_world_size())
     return DataLoader(
         dataset,
         batch_size=cfg.batch_size,
         sampler=sampler,
-        num_workers=cfg.num_workers,
+        num_workers=workers_per_gpu,
         pin_memory=cfg.pin_memory,
         collate_fn=collate_fn,
         prefetch_factor=2,
@@ -447,6 +450,7 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir",      type=str,  default="./runs/btsp_exp")
     parser.add_argument("--epochs",          type=int,  default=30)
     parser.add_argument("--batch_size",      type=int,  default=8)
+    parser.add_argument("--num_workers",     type=int,  default=8)
     parser.add_argument("--freeze_backbone", action="store_true", default=True)
     parser.add_argument("--resume",          type=str,  default=None)
     parser.add_argument("--ablation_mode",   type=str,  default="full",
@@ -464,6 +468,8 @@ if __name__ == "__main__":
     cfg.train.output_dir            = args.output_dir + f"_{args.ablation_mode}"
     cfg.train.epochs                = args.epochs
     cfg.train.batch_size            = args.batch_size
+    cfg.data.batch_size             = args.batch_size
+    cfg.data.num_workers            = args.num_workers
     cfg.model.freeze_backbone       = args.freeze_backbone
     cfg.train.resume                = args.resume
     cfg.model.btsp.ablation_mode    = args.ablation_mode

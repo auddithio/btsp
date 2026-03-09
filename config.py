@@ -78,7 +78,6 @@ class TrainConfig:
 
     # ------- Optimisation -------
     epochs: int = 30
-    batch_size: int = 8
     grad_accum_steps: int = 4
     lr: float = 1e-4
     weight_decay: float = 0.05
