@@ -316,6 +316,7 @@ def build_dataloader(cfg: DataConfig, split: str, shuffle: bool = True) -> DataL
         num_workers=cfg.num_workers,
         pin_memory=cfg.pin_memory,
         collate_fn=collate_fn,
-        prefetch_factor=2,
+        prefetch_factor=4,
+        persistent_workers=True,
         drop_last=True,
     )

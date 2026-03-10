@@ -133,7 +133,8 @@ def build_distributed_dataloader(cfg, split: str) -> DataLoader:
         num_workers=workers_per_gpu,
         pin_memory=cfg.pin_memory,
         collate_fn=collate_fn,
-        prefetch_factor=2,
+        prefetch_factor=4,
+        persistent_workers=True,
         drop_last=True,
     )
 
