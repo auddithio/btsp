@@ -39,7 +39,8 @@ import torch.optim as optim
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
-from torch.cuda.amp import GradScaler, autocast
+from torch.cuda.amp import GradScaler  # keep cuda.amp for compat with older PyTorch
+from torch.amp import autocast
 from torch.utils.tensorboard import SummaryWriter
 try:
     import wandb
@@ -83,16 +84,47 @@ def all_reduce_mean(value: float, device: torch.device) -> float:
 
 
 def build_distributed_dataloader(cfg, split: str) -> DataLoader:
+    from dataset import VideoOrderSampler
+    from collections import defaultdict
     dataset = EpicKitchensAnticipationDataset(cfg, split=split)
-    sampler = DistributedSampler(
-        dataset,
-        num_replicas=dist.get_world_size(),
-        rank=dist.get_rank(),
-        shuffle=(split == "train"),
-        drop_last=True,
-    )
-    # Scale workers down by world size to avoid CPU RAM exhaustion —
-    # total workers = num_workers * world_size, so keep per-GPU count low
+
+    if split == "train":
+        # Build a per-rank video-ordered sampler:
+        # 1. VideoOrderSampler shuffles video order but keeps within-video clip order.
+        # 2. We then assign contiguous video groups to each rank so each rank
+        #    sees a temporally coherent slice — critical for BTSP trace integration.
+        base = VideoOrderSampler(dataset, shuffle=True, seed=42)
+        all_indices = list(base)   # video-ordered indices for this epoch
+        # Shard contiguously by rank so each rank has whole videos, not interleaved clips
+        rank = dist.get_rank()
+        world = dist.get_world_size()
+        # Pad to be divisible
+        pad = (world - len(all_indices) % world) % world
+        all_indices = all_indices + all_indices[:pad]
+        per_rank = len(all_indices) // world
+        rank_indices = all_indices[rank * per_rank:(rank + 1) * per_rank]
+        class OrderedSubsetSampler(torch.utils.data.Sampler):
+            def __init__(self, indices): self.indices = indices
+            def __iter__(self): return iter(self.indices)
+            def __len__(self): return len(self.indices)
+            def set_epoch(self, epoch):
+                # Re-shuffle video order each epoch
+                vs = VideoOrderSampler(dataset, shuffle=True, seed=42 + epoch)
+                ai = list(vs)
+                pad = (world - len(ai) % world) % world
+                ai = ai + ai[:pad]
+                pr = len(ai) // world
+                self.indices = ai[rank * pr:(rank + 1) * pr]
+        sampler = OrderedSubsetSampler(rank_indices)
+    else:
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=dist.get_world_size(),
+            rank=dist.get_rank(),
+            shuffle=False,
+            drop_last=True,
+        )
+
     workers_per_gpu = max(1, cfg.num_workers // dist.get_world_size())
     return DataLoader(
         dataset,
@@ -102,6 +134,7 @@ def build_distributed_dataloader(cfg, split: str) -> DataLoader:
         pin_memory=cfg.pin_memory,
         collate_fn=collate_fn,
         prefetch_factor=2,
+        drop_last=True,
     )
 
 
@@ -172,7 +205,7 @@ class Trainer:
         # accumulates independent memories from its own video shard.
         raw_model = BTSPVideoTransformer(cfg.model, num_verb_classes, num_noun_classes).to(self.device)
         if distributed:
-            self.model = DDP(raw_model, device_ids=[local_rank], find_unused_parameters=False)
+            self.model = DDP(raw_model, device_ids=[local_rank], find_unused_parameters=False, broadcast_buffers=False)
         else:
             self.model = raw_model
         self.raw_model = raw_model  # unwrapped reference for state/memory ops
@@ -199,9 +232,22 @@ class Trainer:
             self.output_dir.mkdir(parents=True, exist_ok=True)
             self.writer = SummaryWriter(self.output_dir / "tb")
             if WANDB_AVAILABLE and cfg.train.wandb_project:
+                # Persist run_id so resumed jobs continue the same wandb run
+                wandb_id_file = self.output_dir / "wandb_run_id.txt"
+                # Only resume a wandb run when we're also resuming a checkpoint.
+                # Fresh runs always get a new run ID, even if an id file exists.
+                if cfg.train.resume and wandb_id_file.exists():
+                    wandb_id = wandb_id_file.read_text().strip()
+                    wandb_resume = "must"
+                else:
+                    wandb_id = wandb.util.generate_id()
+                    wandb_id_file.write_text(wandb_id)
+                    wandb_resume = "allow"
                 wandb.init(
                     project=cfg.train.wandb_project,
                     name=Path(cfg.train.output_dir).name,
+                    id=wandb_id,
+                    resume=wandb_resume,
                     config={
                         "epochs":            cfg.train.epochs,
                         "batch_size":        cfg.train.batch_size,
@@ -212,7 +258,6 @@ class Trainer:
                         "trace_decay":       cfg.model.btsp.trace_decay,
                         "plateau_threshold": cfg.model.btsp.plateau_threshold,
                     },
-                    resume="allow",
                 )
                 self.use_wandb = True
             else:
@@ -231,7 +276,7 @@ class Trainer:
 
     def _train_epoch(self, epoch: int) -> Dict:
         self.model.train()
-        if self.distributed:
+        if hasattr(self.train_loader.sampler, 'set_epoch'):
             self.train_loader.sampler.set_epoch(epoch)
 
         total_loss = 0.0
@@ -264,7 +309,7 @@ class Trainer:
             }
 
             # ---- Forward + combined loss ----
-            with autocast(enabled=self.cfg.train.use_amp):
+            with autocast('cuda', enabled=self.cfg.train.use_amp):
                 verb_logits, noun_logits, new_state, aux = self.model(pixel_values, batch_state)
                 task_loss = (
                     self.criterion(verb_logits, verb_labels) +
@@ -352,7 +397,7 @@ class Trainer:
                 "prev_z":   torch.cat([s["prev_z"]   for s in states], dim=0),
             }
 
-            with autocast(enabled=self.cfg.train.use_amp):
+            with autocast('cuda', enabled=self.cfg.train.use_amp):
                 verb_logits, noun_logits, new_state, aux = self.model(pixel_values, batch_state)
                 total_loss += (
                     self.criterion(verb_logits, verb_labels) +
@@ -496,6 +541,10 @@ if __name__ == "__main__":
     parser.add_argument("--num_workers",     type=int,  default=8)
     parser.add_argument("--freeze_backbone", action="store_true", default=True)
     parser.add_argument("--resume",          type=str,  default=None)
+    parser.add_argument("--lr",              type=float, default=None,
+                        help="Override learning rate (e.g. 5e-6 for LR tail on resume)")
+    parser.add_argument("--grad_accum_steps", type=int,  default=None,
+                        help="Override gradient accumulation steps")
     parser.add_argument("--ablation_mode",   type=str,  default="full",
                         choices=["full", "random", "frozen"],
                         help="full=standard BTSP | random=matched-rate noise writes | frozen=no writes")
@@ -517,6 +566,10 @@ if __name__ == "__main__":
     cfg.model.freeze_backbone       = args.freeze_backbone
     cfg.train.resume                = args.resume
     cfg.model.btsp.ablation_mode    = args.ablation_mode
+    if args.lr is not None:
+        cfg.train.lr = args.lr
+    if args.grad_accum_steps is not None:
+        cfg.train.grad_accum_steps = args.grad_accum_steps
 
     trainer = Trainer(cfg, num_verb_classes=args.num_verb_classes,
                       num_noun_classes=args.num_noun_classes, distributed=args.distributed)

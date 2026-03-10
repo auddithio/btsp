@@ -215,6 +215,11 @@ class BTSPVideoTransformer(nn.Module):
         # ---- 6. Memory read (gradients flow through query projection) ----
         retrieved, sim_scores = self.memory.read(z)
 
+        # For frozen ablation, explicitly zero retrieved so fusion layer
+        # cannot learn from whatever noise might be in memory
+        if self.memory.ablation_mode == "frozen":
+            retrieved = retrieved * 0.0
+
         # ---- 7. Fusion ----
         h = self.fusion(z, retrieved)    # (B, D)
 

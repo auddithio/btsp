@@ -251,15 +251,71 @@ def collate_fn(batch: List[dict]) -> dict:
     }
 
 
+class VideoOrderSampler(torch.utils.data.Sampler):
+    """
+    Shuffles the ORDER of videos each epoch, but preserves clip order
+    within each video.  This gives BTSP the temporal continuity it needs
+    (so eligibility traces actually integrate over a real video stream)
+    while still randomising the training distribution across epochs.
+
+    With clip-level shuffle (the previous default) nearly every clip has
+    is_new_video=True, state resets every step, and BTSP degenerates to
+    writing the raw current embedding on every clip — no temporal
+    integration occurs and all ablation modes become equivalent.
+    """
+
+    def __init__(self, dataset: EpicKitchensAnticipationDataset, shuffle: bool = True, seed: int = 0):
+        self.dataset = dataset
+        self.shuffle = shuffle
+        self.seed = seed
+        self.epoch = 0
+
+        # Group clip indices by video_id (preserving within-video order,
+        # which is guaranteed by the sort in _load_annotations)
+        from collections import defaultdict
+        groups: dict = defaultdict(list)
+        for idx, clip in enumerate(dataset.clips):
+            groups[clip["video_id"]].append(idx)
+        self.video_ids = list(groups.keys())
+        self.groups = [groups[v] for v in self.video_ids]
+
+    def set_epoch(self, epoch: int):
+        self.epoch = epoch
+
+    def __iter__(self):
+        if self.shuffle:
+            g = torch.Generator()
+            g.manual_seed(self.seed + self.epoch)
+            video_order = torch.randperm(len(self.groups), generator=g).tolist()
+        else:
+            video_order = list(range(len(self.groups)))
+
+        indices = []
+        for v in video_order:
+            indices.extend(self.groups[v])
+        return iter(indices)
+
+    def __len__(self):
+        return len(self.dataset)
+
+
 def build_dataloader(cfg: DataConfig, split: str, shuffle: bool = True) -> DataLoader:
     dataset = EpicKitchensAnticipationDataset(cfg, split=split)
+    # Use VideoOrderSampler for train: shuffles video order each epoch but
+    # preserves within-video clip ordering so BTSP traces integrate properly.
+    # Val uses default sequential order (no shuffle needed).
+    if split == "train":
+        sampler = VideoOrderSampler(dataset, shuffle=shuffle, seed=42)
+    else:
+        sampler = None
     return DataLoader(
         dataset,
         batch_size=cfg.batch_size,
-        shuffle=shuffle and (split == "train"),
+        sampler=sampler,
+        shuffle=False,   # sampler handles ordering; shuffle must be False when sampler is set
         num_workers=cfg.num_workers,
         pin_memory=cfg.pin_memory,
         collate_fn=collate_fn,
         prefetch_factor=2,
-        drop_last=True,   # ensures all ranks get identical batch counts in DDP
+        drop_last=True,
     )

@@ -73,7 +73,7 @@ class DataConfig:
 
 @dataclass
 class TrainConfig:
-    output_dir: str = "./runs/btsp_exp"
+    output_dir: str = "./runs/ek_final"
     seed: int = 42
 
     # ------- Optimisation -------
