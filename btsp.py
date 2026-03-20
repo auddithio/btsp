@@ -75,6 +75,8 @@ class PlateauDetector(nn.Module):
         super().__init__()
         self.threshold = cfg.plateau_threshold
         self.cooldown = cfg.plateau_cooldown
+        self.register_buffer("running_mean", torch.tensor(0.5))
+        self.register_buffer("running_std", torch.tensor(0.1))
         # Per-sample cooldown counter (not a parameter — managed externally)
 
     @torch.no_grad()
@@ -91,6 +93,11 @@ class PlateauDetector(nn.Module):
         threshold_exceeded = surprise > self.threshold           # (B,) bool
         off_cooldown = cooldown_counter >= self.cooldown         # (B,) bool
         plateau_mask = threshold_exceeded & off_cooldown         # (B,) bool
+
+        self.running_mean = 0.99 * self.running_mean + 0.01 * surprise.mean()
+        self.running_std  = 0.99 * self.running_std  + 0.01 * surprise.std()
+        threshold = self.running_mean + self.running_std
+        plateau_mask = (surprise > threshold) & off_cooldown
 
         # Update cooldown: reset to 0 where plateau fired, else increment
         new_counter = torch.where(

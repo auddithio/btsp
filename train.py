@@ -85,7 +85,6 @@ def all_reduce_mean(value: float, device: torch.device) -> float:
 
 def build_distributed_dataloader(cfg, split: str) -> DataLoader:
     from dataset import VideoOrderSampler
-    from collections import defaultdict
     dataset = EpicKitchensAnticipationDataset(cfg, split=split)
 
     if split == "train":
@@ -316,7 +315,9 @@ class Trainer:
                     self.criterion(verb_logits, verb_labels) +
                     self.criterion(noun_logits, noun_labels)
                 )
-                loss = (task_loss + 0.1 * aux["pred_loss"]) / self.cfg.train.grad_accum_steps
+                pred_loss_weight = 1.0 if epoch <= 2 else 0.1
+                loss = (task_loss + pred_loss_weight * aux["pred_loss"]) / self.cfg.train.grad_accum_steps
+                # loss = (task_loss + 0.1 * aux["pred_loss"]) / self.cfg.train.grad_accum_steps
 
             self.scaler.scale(loss).backward()
 

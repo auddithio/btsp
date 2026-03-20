@@ -54,7 +54,7 @@ class ModelConfig:
     btsp: BTSPConfig = field(default_factory=BTSPConfig)
 
     # ------- Fusion -------
-    fusion: str = "concat"   # "concat" | "add" | "gate"
+    fusion: str = "gate"   # "concat" | "add" | "gate"
 
 
 @dataclass
